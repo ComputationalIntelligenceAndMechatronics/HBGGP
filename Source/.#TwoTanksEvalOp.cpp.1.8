@@ -1,0 +1,402 @@
+/*
+ *  TwoTanksEvalOp.cpp
+ *  Copyright 2009 Jean-Francois Dupuis.
+ *
+ *  This file is part of HBGGP.
+ *  
+ *  HBGGP is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  HBGGP is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with HBGGP.  If not, see <http://www.gnu.org/licenses/>.
+ *  
+ *  This file was created by Jean-Francois Dupuis on 10/11/09.
+ */
+
+#include "TwoTanksEvalOp.h"
+#include "FSAFitness.h"
+#include "RootReturn.h"
+#include "FSAContext.h"
+
+//using namespace Beagle;
+//
+//Fitness::Handle TwoTanksEvalOp::evaluate(GP::Individual& inIndividual, GP::Context& ioContext) {
+//	FSAContext& lContext = castObjectT<FSAContext&>(ioContext);
+//	FSAFitness::Handle lFitness = new FSAFitness;
+//	
+//	RootReturn lResult;
+//	inIndividual.run(lResult, lContext);
+//	lFitness->setFSA(lContext.getFSA());
+//	
+//	lFitness->setValue(ioContext.getSystem().getRandomizer().getFloat());
+//	return lFitness;
+//	
+//	/////
+//	TwoTanksController *lController = new TwoTanksController(10);
+//	HybridBondGraph lTwoTankHBG;
+//	lController->createBondGraph(lTwoTankHBG);
+//
+//	try{
+//		vector<bool> lInitialSwitchState(2,false); //Initial switch state
+//		vector<double> lInitialState(2,0); //Initial level
+//		lHBG.setInitialState(lInitialSwitchState,lInitialState);
+//		lHBG.simulate(5e-4, 1e-8); //Simulation
+////		lHBG.writeSimulationLog(lFilename+string(".csv"));
+//		
+//	} catch(std::runtime_error inError) {
+//		std::cerr << "Error catched : " << inError.what() << std::endl;
+//	}
+//}
+
+#include "LogFitness.h"
+#include "TwoTanksController.h"
+#include "TwoTanksSystemDynamic.h"
+#include "Simulator.h"
+#include "FSAException.h"
+#ifndef WITHOUT_GRAPHVIZ
+#include "IndividualPlotter.h"
+#endif
+
+#include <cmath>
+#include <cfloat>
+#include <vector>
+#include <map>
+
+#define NBTANKS 2
+
+using namespace Beagle;
+
+
+/*!
+ *  \brief Evaluate the fitness of the given individual.
+ *  \param inIndividual Current individual to evaluate.
+ *  \param ioContext Evolutionary context.
+ *  \return Handle to the fitness value of the individual.
+ */
+Fitness::Handle TwoTanksEvalOp::evaluate(GP::Individual& inIndividual, GP::Context& ioContext)
+{
+	Beagle_AssertM(inIndividual.size() == 1);
+	
+	FSAContext& lContext = castObjectT<FSAContext&>(ioContext);
+	FSAFitness::Handle lFitness = new FSAFitness;
+	
+	RootReturn lResult;
+	lContext.reset();
+	inIndividual.run(lResult, lContext);
+	lFitness->setFSA(lContext.getFSA());
+
+	///Debug
+	lFitness->setValue(ioContext.getSystem().getRandomizer().getFloat());
+	return lFitness;
+	///Debug
+	
+	if(!lContext.getFSA()->verify()) {
+		ostringstream lStream;
+		PACC::XML::Streamer lStreamer(lStream);
+		lContext.getFSA()->write(lStreamer,true);
+#ifndef WITHOUT_GRAPHVIZ
+		plotIndividual(inIndividual,"badindividual.svg");
+#endif
+		throw Beagle_RunTimeExceptionM(std::string("Bad FSA")+lStream.str()+std::string(" from ")+inIndividual.serialize());
+	}
+	
+	GrowingFSA::Handle lGFSA = lContext.getFSA();
+	FSA::FiniteStateAutomaton *lFSA = &(*lGFSA);
+	lFSA->setInitialState(lFSA->getState(0));
+	TwoTanksController lController(lFSA);
+	
+	
+	//Initialize the simulation
+	std::map<std::string, std::vector<double> > lLogger;
+	lController.setLogger(&lLogger);
+	TwoTanksSystemDynamic *lDynamic = new TwoTanksSystemDynamic(&lLogger);
+	
+	std::vector<double> lInitialLevels(mTanksLevelsIni->size());
+	for(unsigned int i = 0; i< mTanksLevelsIni->size(); ++i) {
+		lInitialLevels[i] = (*mTanksLevelsIni)[i];
+	}
+	lDynamic->initialize(lInitialLevels);
+	lController.initialize(lInitialLevels);
+	
+	Simulator lSimulator(lDynamic, &lController);
+	lSimulator.setTimeStep(mDiscreteTimeStep->getWrappedValue(), mContinuousTimeStep->getWrappedValue());
+	
+	//Simulate every target prior to this generation
+	try {
+		vector<double> lFitnessVector;
+		unsigned int lTry = 0;
+		for(int g = mSimulationCases.size()-1; g >= 0; --g) {
+			bool lRun = false;
+			if( (*mGenerationSteps)[0] < 0 )
+				lRun = true;
+			else if( ioContext.getGeneration() >= (*mGenerationSteps)[g] )
+				lRun = true;
+			if(lRun) {
+				
+				lLogger.clear();
+				lDynamic->reset();
+				lController.initialize(lInitialLevels);
+				
+				//Run the simulation
+				for(unsigned int i = 0; i < mSimulationCases[g].getSize(); ++i) {
+					if( mSimulationCases[g].getTime(i) >= mSimulationDuration->getWrappedValue() )
+						throw Beagle_RunTimeExceptionM("TwoTanksEvalOp : Applying control target later than simulation end");
+					if(mSimulationCases[g].getTargets(i).size() != 2)
+						throw Beagle_RunTimeExceptionM("TwoTanksEvalOp : There should be a target pair for each control time");
+					
+					lController.setTarget(mSimulationCases[g].getTargets(i));
+					
+					if(i < mSimulationCases[g].getSize()-1) 
+						lSimulator.simulate(mSimulationCases[g].getTime(i+1));
+					else
+						lSimulator.simulate(mSimulationDuration->getWrappedValue());
+					
+				}
+				
+				//Evaluate the results
+				//The mean error on the two tanks is used as a the performance measure
+				std::vector<std::string> lLevelTarget(2);
+				std::vector<std::string> lTankLevel(2);
+				lLevelTarget[0] = "Target0";
+				lLevelTarget[1] = "Target1";
+				lTankLevel[0] = "Level0";
+				lTankLevel[1] = "Level1";
+				
+//				std::vector<double> lErrors(2,0);
+//				for(int i = 0; i < lErrors.size(); ++i) {
+//					for(int j = 0; j < lLogger[lTankLevel[i]].size()-1; ++j) {
+//						double a = lLogger[lTankLevel[i]][j] - lLogger[lLevelTarget[i]][j];
+//						double b = lLogger[lTankLevel[i]][j+1] - lLogger[lLevelTarget[i]][j+1];
+//						double dt = lLogger["time"][j+1] - lLogger["time"][j];
+//						lErrors[i] += fabs( (a+b)/2*dt ) * fabs( (a+b)/2*dt );;
+//					}
+//				}
+				
+				unsigned int lDataSize = lLogger[lTankLevel[0]].size();
+				std::vector<double> lError1(lDataSize);
+				std::vector<double> lError2(lDataSize);
+				for(unsigned int i = 0; i < lDataSize; ++i) {
+					lError1[i] = fabs(lLogger[lTankLevel[0]][i] - lLogger[lLevelTarget[0]][i]);
+					lError2[i] = fabs(lLogger[lTankLevel[1]][i] - lLogger[lLevelTarget[1]][i]);
+				}
+				
+				std::vector<double> lErrors(2,0);
+				for(unsigned int i = 0; i < lDataSize-1; ++i) {
+					double dt = lLogger["time"][i+1] - lLogger["time"][i];
+					lErrors[0] += (lError1[i]+lError1[i+1])/2*dt;
+					lErrors[1] += (lError2[i]+lError2[i+1])/2*dt;
+				}
+				
+				
+				
+				
+				//			//Take the mean errors of the two tanks
+				//			double lF = (lErrors[0]+lErrors[1])/2;
+				
+				//Take the worst of the two tanks
+				double lF = max(lErrors[0],lErrors[1]);
+				
+				if(lF != 0)
+					lF = 1/lF;
+				else
+					lF = DBL_MAX;
+				
+				//Log simulation data
+				lFitnessVector.push_back(lF);
+				lFitness->addDataSet(lTry, lF);
+				for(map<std::string, std::vector<double> >::const_iterator lIter = lLogger.begin(); lIter != lLogger.end(); ++lIter) {
+					lFitness->addData(lIter->first, lIter->second,lTry);
+				}
+				++lTry;
+			}
+		}
+		
+		//	//Compute mean of fitness
+		//	double lMeanF = 0;
+		//	for(unsigned int i = 0; i < lFitnessVector.size(); ++i) {
+		//		lMeanF += lFitnessVector[i];
+		//	}
+		//	lMeanF /= lFitnessVector.size();
+		//	lFitness->setValue(lMeanF);	
+		
+//		//Look at the worst test case, in max case
+//		double lMinF = DBL_MAX;
+//		for(unsigned int i = 0; i < lFitnessVector.size(); ++i) {
+//			if(lFitnessVector[i] < lMinF) {
+//				lMinF = lFitnessVector[i];
+//			}
+//		}
+//		lFitness->setValue(lMinF);
+		
+		//Look at the worst test case, in min case
+		double lMaxF = 0;
+		for(unsigned int i = 0; i < lFitnessVector.size(); ++i) {
+			if(lFitnessVector[i] > lMaxF) {
+				lMaxF = lFitnessVector[i];
+			}
+		}
+		lFitness->setValue(lMaxF);
+		
+	} catch(FSAException lError) {
+		Beagle_LogDetailedM(
+						 ioContext.getSystem().getLogger(),
+						 "evaluate", "TwoTanksEvalOp",
+						 lError.what()
+						 );
+		lFitness->setValue(DBL_MAX);
+	}
+	//lFitness->setValue(ioContext.getSystem().getRandomizer().getFloat());
+	return lFitness;
+}
+
+
+/*!
+ *  \brief Initialize the evaluation operator.
+ *  \param ioSystem Evolutionary system.
+ */
+void TwoTanksEvalOp::initialize(Beagle::System& ioSystem)
+{
+	FSAEvalOp::initialize(ioSystem);
+
+	PACC::XML::Streamer lStreamer(std::cout);
+	ioSystem.getRegister().write(lStreamer,true);
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.generationstep")) {
+		mGenerationSteps = castHandleT<FloatArray>(ioSystem.getRegister()["sim.control.generationstep"]);
+	} else {
+		mGenerationSteps = new FloatArray(1,-1);
+		Register::Description lDescription(
+										   "Generation for control target transition, -1 mean no transition",
+										   "FloatArray",
+										   mGenerationSteps->serialize(),
+										   "Generation for control target transition"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.generationstep", mGenerationSteps, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.target")) {
+		mTargetString = castHandleT<String>(ioSystem.getRegister()["sim.control.target"]);
+	} else {
+		mTargetString = new String;
+		Register::Description lDescription(
+										   "Controller target, by pair for each control time",
+										   "String",
+										   mTargetString->serialize(),
+										   "Tank levels target for the controller"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.target", mTargetString, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.tol")) {
+		mTargetTolerances = castHandleT<Float>(ioSystem.getRegister()["sim.control.tol"]);
+	} else {
+		mTargetTolerances = new Float(0.005);
+		Register::Description lDescription(
+										   "Controller target tolerance",
+										   "Float",
+										   mTargetTolerances->serialize(),
+										   "Tank levels tolerance for the controller"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.tol", mTargetTolerances, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.dynamic.levelini")) {
+		mTanksLevelsIni = castHandleT<FloatArray>(ioSystem.getRegister()["sim.tanks.levelini"]);
+	} else {
+		mTanksLevelsIni = new FloatArray(2,0.25);
+		Register::Description lDescription(
+										   "Initial tank levels",
+										   "Float",
+										   mTanksLevelsIni->serialize(),
+										   "Initial tank levels"
+										   );
+		ioSystem.getRegister().addEntry("sim.dynamic.levelini", mTanksLevelsIni, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.timestep")) {
+		mDiscreteTimeStep = castHandleT<Float>(ioSystem.getRegister()["sim.control.timestep"]);
+	} else {
+		mDiscreteTimeStep = new Float(1e-3);
+		Register::Description lDescription(
+										   "Controller time step",
+										   "Float",
+										   mDiscreteTimeStep->serialize(),
+										   "Controller time step"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.timestep", mDiscreteTimeStep, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.dynamic.timestep")) {
+		mContinuousTimeStep = castHandleT<Float>(ioSystem.getRegister()["sim.dynamic.timestep"]);
+	} else {
+		mContinuousTimeStep = new Float(1e-4);
+		Register::Description lDescription(
+										   "Dynamic time step",
+										   "Float",
+										   mContinuousTimeStep->serialize(),
+										   "Dynamic time step"
+										   );
+		ioSystem.getRegister().addEntry("sim.dynamic.timestep", mContinuousTimeStep, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.duration.time")) {
+		mSimulationDuration = castHandleT<Float>(ioSystem.getRegister()["sim.duration.time"]);
+	} else {
+		mSimulationDuration = new Float(5);
+		Register::Description lDescription(
+										   "Simulation duration",
+										   "Float",
+										   mSimulationDuration->serialize(),
+										   "Simulation duration"
+										   );
+		ioSystem.getRegister().addEntry("sim.duration.time", mSimulationDuration, lDescription);
+	}
+}
+
+
+/*!
+ *  \brief Post-initialize the evaluation operator.
+ *  \param ioSystem Evolutionary system.
+ */
+void TwoTanksEvalOp::postInit(Beagle::System& ioSystem)
+{
+	FSAEvalOp::postInit(ioSystem);
+	
+	
+	if(*mTargetString == Beagle::String("")) {
+		SimulationCase lCase;
+		vector<double> lLimits(2);	lLimits[0] = 0.1; lLimits[1] = 0.5;
+		vector<double> lTimes(1,0);
+		lCase.createRandomCase(&ioSystem.getRandomizer(),NBTANKS,lLimits,lTimes);
+		ostringstream lStream;
+		lCase.write(lStream);
+		mSimulationCases.push_back(lCase);
+		mTargetString = new String(lStream.str());
+	} 
+	
+	readSimulationCase(*mTargetString, mSimulationCases);
+	
+//	if(mSimulationCases.empty()) {
+//		
+//	}
+	
+	if(mSimulationCases[0].getTime(0) != 0) {
+		throw Beagle_RunTimeExceptionM("TwoTanksEvalOp : Not applying control target at time 0");
+	}
+	
+	if(mGenerationSteps->size() > 0) {
+		if((*mGenerationSteps)[0] >= 0) {
+			if((*mGenerationSteps)[0] != 0) {
+				throw Beagle_RunTimeExceptionM("TwoTanksEvalOp : Not applying control target at generation 0");
+			}
+		}
+	}
+}
+

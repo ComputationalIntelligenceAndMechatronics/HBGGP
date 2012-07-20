@@ -1,0 +1,568 @@
+/*
+ *  DCDCBoostEvalOp.cpp
+ *  Copyright 2010 Jean-Francois Dupuis.
+ *
+ *  This file is part of HBGGP.
+ *  
+ *  HBGGP is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  HBGGP is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with HBGGP.  If not, see <http://www.gnu.org/licenses/>.
+ *  
+ *  This file was created by Jean-Francois Dupuis on 25/03/10.
+ */
+
+#include "DCDCBoostEvalOp.h"
+
+#include "BGFitness.h"
+#include <BondGraph.h>
+#include <RootReturn.h>
+#include "BGContext.h"
+#include "GrowingHybridBondGraph.h"
+#include "TreeSTag.h"
+#include <cfloat>
+#include "DCDCBoostLookaheadController.h"
+#include "BGException.h"
+#include "IndividualPlotter.h"
+#include "ParametersHolder.h"
+#include "VectorUtil.h"
+
+using namespace Beagle;
+using namespace BG;
+
+#ifdef SINGLE_OUTPUT
+#define NBOUTPUTS 1
+#define NBPARAMETERS 2
+#else
+#define NBOUTPUTS 3
+#define NBPARAMETERS 3
+#endif
+
+DCDCBoostEvalOp::DCDCBoostEvalOp(std::string inName) : BondGraphEvalOp(inName)
+{ 
+	
+}
+
+DCDCBoostEvalOp::~DCDCBoostEvalOp() {
+}
+
+/*!
+ *  \brief Evaluate the fitness of the given individual.
+ *  \param inIndividual Current individual to evaluate.
+ *  \param ioContext Evolutionary context.
+ *  \return Handle to the fitness value of the individual.
+ */
+Beagle::Fitness::Handle DCDCBoostEvalOp::evaluate(Beagle::GP::Individual& inIndividual, Beagle::GP::Context& ioContext) {
+	Beagle_StackTraceBeginM();
+	Beagle_AssertM(inIndividual.size() == 1);
+	
+	
+	BGFitness *lFitness = new BGFitness(0);
+	GrowingHybridBondGraph::Handle lBondGraph;
+	TreeSTag::Handle lTree = castHandleT<TreeSTag>(inIndividual[0]);
+	
+	
+	
+	try {
+		//Get the parameters
+		Beagle::Component::Handle lHolderComponent = ioContext.getSystem().getComponent("ParametersHolder");
+		if(lHolderComponent==NULL)
+			throw Beagle_RunTimeExceptionM("No ParameterHolder holder component found in the system!");
+		ParametersHolder::Handle lHolder = castHandleT<ParametersHolder>(lHolderComponent);
+		if(lHolder==NULL)
+			throw Beagle_RunTimeExceptionM("Component named \"ParameterHolder\" found is not of the good type!");
+		lHolder->clear();
+		
+		//Run the individual to create the bond graph.
+		RootReturn lResult;
+		inIndividual.run(lResult, ioContext);
+		BGContext& lContext = castObjectT<BGContext&>(ioContext);
+		lBondGraph = castHandleT<GrowingHybridBondGraph>(lContext.getBondGraph());
+		//lBondGraph->setDifferentialCausalitySupport(false);
+		lFitness->setBondGraph(lBondGraph);
+
+		Beagle_LogDebugM(
+						 ioContext.getSystem().getLogger(),
+						 "evaluation", "DCDCBoostEvalOp",
+						 std::string("Evaluating bondgrap: ")+
+						 lBondGraph->BondGraph::serialize()
+						 );
+		
+#ifdef DEBUG
+		ofstream lFilestream("Bondgraph_ns.xml");
+		PACC::XML::Streamer lStreamer(lFilestream);
+		lBondGraph->write(lStreamer);
+		inIndividual.write(lStreamer);
+		lBondGraph->plotGraph("BondGraph_ns.svg");
+		
+//		PACC::XML::Document lDocument;
+//		lDocument.parse("Bondgraph_ns.xml");
+//		HybridBondGraph lBondGraph2;
+//		lBondGraph2.read(lDocument.getFirstRoot());
+//		ofstream lFilestream3("Bondgraph2_ns.xml");
+//		PACC::XML::Streamer lStreamer3(lFilestream3);
+//		lBondGraph2.write(lStreamer3);
+//		lBondGraph2.plotGraph("Bondgraph2_ns.svg");
+#endif
+		lBondGraph->simplify();	
+		
+		Beagle_LogDebugM(
+						 ioContext.getSystem().getLogger(),
+						 "evaluation", "DCDCBoostEvalOp",
+						 std::string("Evaluating simplified bondgrap: ")+
+						 lBondGraph->BondGraph::serialize()
+						 );
+
+#ifdef DEBUG
+		lBondGraph->plotGraph("BondGraph.svg");
+		ofstream lFilestream2("Bondgraph.xml");
+		PACC::XML::Streamer lStreamer2(lFilestream2);
+		lBondGraph->write(lStreamer2);
+		inIndividual.write(lStreamer2);
+		plotIndividual(inIndividual,"Individual.svg");
+		
+//		PACC::XML::Document lDocument2;
+//		lDocument2.parse("Bondgraph.xml");
+//		HybridBondGraph lBondGraph3;
+//		lBondGraph3.read(lDocument2.getFirstRoot());
+//		ofstream lFilestream4("Bondgraph2.xml");
+//		PACC::XML::Streamer lStreamer4(lFilestream4);
+//		lBondGraph3.write(lStreamer4);
+//		lBondGraph3.plotGraph("Bondgraph2.svg");
+		
+#endif
+	
+		//Check if the restriction of the number of switch is fullfilled
+		if( (lBondGraph->getSwitches().size() > mMaxNumberSwitch->getWrappedValue()) && (mMaxNumberSwitch->getWrappedValue() != -1) ) {
+			lFitness->setValue(0);
+			return lFitness;
+		}
+		
+//		lFitness->setValue(ioContext.getSystem().getRandomizer().rollUniform(0,0.9));
+//		return lFitness;
+		
+		//Evaluate the bond graph
+		//Initialize the simulation
+		std::map<std::string, std::vector<double> > &lLogger = lBondGraph->getSimulationLog();
+		DCDCBoostLookaheadController *lController = dynamic_cast<DCDCBoostLookaheadController*>(lBondGraph->getControllers()[0]);
+		lController->setSimulationDuration(mContinuousTimeStep->getWrappedValue());
+		
+#ifndef ALLOW_DIFFCAUSALITY 
+		lBondGraph->setDifferentialCausalitySupport(false);
+#endif
+		
+		try {
+			std::vector<double> lInitialOutput(1,0);
+		
+			//Find a valid initial state
+			unsigned int lInitialSwitchState = 0;
+			double lMaxConfiguration = pow(2.0,int(lBondGraph->getSwitches().size()));
+			for(;lInitialSwitchState < lMaxConfiguration; ++lInitialSwitchState) { 
+				try{ 
+					lController->initialize(&(*lBondGraph),lInitialSwitchState);
+				} catch(BG::CausalityException inError) {
+					continue;
+				}
+				break;
+			}
+			
+			//Check if a valid initial state have been found
+			if(lInitialSwitchState == lMaxConfiguration) {
+				lFitness->setValue(0);
+				return lFitness;
+			}
+			
+			//Simulate every target prior to this generation
+			vector<double> lFitnessVector;
+			unsigned int lTry = 0;
+			for(int g = mSimulationCases.size()-1; g >= 0; --g) {
+				bool lRun = false;
+				if( (*mGenerationSteps)[0] < 0 )
+					lRun = true;
+				else if( ioContext.getGeneration() >= (*mGenerationSteps)[g] )
+					lRun = true;
+				if(lRun) {
+					
+					
+					
+					lLogger.clear();
+					lBondGraph->reset();
+					lController->initialize(&(*lBondGraph),lInitialSwitchState);
+					
+					//Run the simulation
+					for(unsigned int i = 0; i < mSimulationCases[g].getSize(); ++i) {
+						
+						if( mSimulationCases[g].getTime(i) >= mSimulationDuration->getWrappedValue() )
+							throw Beagle_RunTimeExceptionM("DCDCBoostEvalOp : Applying control target later than simulation end");
+						if(mSimulationCases[g].getTargets(i).size() != NBOUTPUTS-1)
+							throw Beagle_RunTimeExceptionM("DCDCBoostEvalOp : There should be 1 target value for each control time");
+						if(mSimulationCases[g].getParameters(i).size() != NBPARAMETERS)
+							throw Beagle_RunTimeExceptionM("DCDCBoostEvalOp : There should be 1 parameter value for each control time");
+		
+						//Assign parameters
+						const vector<double>& lParameters = mSimulationCases[g].getParameters(i);
+						if(!lParameters.empty()) {
+							lBondGraph->clearStateMatrix();
+						}
+						assert(lHolder->size() == lParameters.size());
+						for(unsigned int k = 0; k < lParameters.size(); ++k) {
+							(*lHolder)[k]->setValue(lParameters[k]);
+						}
+						
+						//Compute the current target
+						vector<double> lTargets = mSimulationCases[g].getTargets(i);
+						double lCurrentTarget = 0;
+						for(unsigned int k = 0; k < lTargets.size(); ++k) {
+							lCurrentTarget += lTargets[k]*lTargets[k]/(lParameters[0]*lParameters[k+1]);
+						}
+						lTargets.push_back(lCurrentTarget);
+					
+						lController->setTarget(lTargets);
+						
+						
+						if(i < mSimulationCases[g].getSize()-1) 
+							lBondGraph->simulate(mSimulationCases[g].getTime(i+1),mContinuousTimeStep->getWrappedValue(),false);
+						else
+							lBondGraph->simulate(mSimulationDuration->getWrappedValue(),mContinuousTimeStep->getWrappedValue(),false);
+
+					}
+					
+					//Evaluate the results
+					double lF = computeError(&(*lBondGraph),lLogger);
+					//double lF = ioContext.getSystem().getRandomizer().rollUniform(0,0.9);
+
+					//Clean logger
+					for(map<std::string, vector<double> >::iterator lIter = lLogger.begin(); lIter != lLogger.end();) {
+						if(lIter->first != "Output_0" &&
+						   lIter->first != "Output_1" &&
+						   lIter->first != "Output_2" &&
+						   lIter->first != "Target_0" &&
+						   lIter->first != "Target_1" &&
+						   lIter->first != "Target_2" &&
+						   lIter->first != "State" &&
+						   lIter->first != "time" &&
+						   lIter->first != "S1") {
+							lLogger.erase(lIter++);
+						} else {
+							++lIter;		
+						}
+					}
+					
+					//Log simulation data
+					lFitnessVector.push_back(lF);
+					lFitness->addDataSet(lTry, lF);
+					for(map<std::string, std::vector<double> >::const_iterator lIter = lLogger.begin(); lIter != lLogger.end(); ++lIter) {
+						lFitness->addData(lIter->first, lIter->second,lTry);
+					}
+					++lTry;
+				}
+			}
+			
+			//Take the average of all test case
+			double lAvg = 0;
+			for(unsigned int i = 0; i < lFitnessVector.size(); ++i) {
+				lAvg += lFitnessVector[i];
+			}
+			lAvg = lAvg/lFitnessVector.size();
+			lFitness->setValue(lAvg);
+			
+			/*	
+			 //Look at the worst test case
+			 double lMinF = DBL_MAX;
+			 for(unsigned int i = 0; i < lFitnessVector.size(); ++i) {
+			 if(lFitnessVector[i] < lMinF) {
+			 lMinF = lFitnessVector[i];
+			 }
+			 }
+			 
+			 lFitness->setValue(lMinF);
+			 */		
+			Beagle_LogTraceM(
+							 ioContext.getSystem().getLogger(),
+							 "evaluation", "DCDCBoostEvalOp",
+							 std::string("Result of evaluation1: ")+
+							 lFitness->serialize()
+							 );
+			
+		} 
+		catch(BG::CausalityException inError) {
+			lFitness->setValue(0);
+		}
+		
+	}
+	catch(std::runtime_error inError) {
+		std::cerr << "Error catched while evaluating the bond graph: " << inError.what() << std::endl;
+		
+		//Save bond graph for debuging
+		std::ostringstream lFilename;
+		lFilename << "bug/bondgraph_bug_" << ioContext.getGeneration() << "_" << ioContext.getIndividualIndex();
+#ifndef WITHOUT_GRAPHVIZ
+		lBondGraph->plotGraph(lFilename.str()+std::string(".svg"));
+#endif
+		ofstream lFileStream((lFilename.str()+std::string(".xml")).c_str());
+		PACC::XML::Streamer lStreamer(lFileStream);
+		lBondGraph->write(lStreamer);
+		inIndividual.write(lStreamer);
+		
+		//Assign null fitness
+		lFitness->setValue(0);
+		
+		
+		
+#ifdef STOP_ON_ERROR
+		exit(EXIT_FAILURE);
+#endif
+    }
+	
+	Beagle_LogTraceM(
+					 ioContext.getSystem().getLogger(),
+					 "evaluation", "DCDCBoostEvalOp",
+					 std::string("Result of evaluation: ")+
+					 lFitness->serialize()
+					 );
+	
+	//delete lBondGraph;
+	
+	return lFitness;
+	Beagle_StackTraceEndM("void DCDCBoostEvalOp::evaluate(Beagle::GP::Individual& inIndividual, Beagle::GP::Context& ioContext)");
+}
+
+double DCDCBoostEvalOp::computeError(const BondGraph* inBondGraph, std::map<std::string, std::vector<double> > &inSimulationLog) {
+	
+	std::vector<double> lErrors(NBOUTPUTS,0);
+	for(unsigned int k = 0; k < NBOUTPUTS; ++k) {
+		const std::vector<double>& lTarget = inSimulationLog[std::string("Target_")+int2str(k)];
+		const std::vector<double>& lOutput = inSimulationLog[std::string("Output_")+int2str(k)];
+		const std::vector<double>& lTime = inSimulationLog["time"];
+		
+		unsigned int lDataSize = lTime.size();
+		assert(lTime.size() == lOutput.size());
+		assert(lTime.size() == lTarget.size());
+		assert(lDataSize != 0);
+		
+		std::vector<double> lError(lDataSize);
+		for(unsigned int i = 0; i < lDataSize; ++i) {
+			lError[i] = fabs(lOutput[i] - lTarget[i]);
+
+//			lErrorI[i] = inSimulationLog[lOutputI][i] - inSimulationLog[lTargetI][i];
+//			if(lErrorI[i] < 0)
+//				lErrorI[i] = 0; //if under limit, fine no penalty
+//			else
+//				lErrorI[i] *= lErrorI[i]; //if over, greatly penalise.
+			
+		}
+		
+		//Integrate the error vector
+		for(unsigned int i = 0; i < lDataSize-1; ++i) {
+			double dt = lTime[i+1] - lTime[i];
+			lErrors[k] += (lError[i]+lError[i+1])/2*dt;
+		}
+	}
+	
+//	//Take the mean errors of the two targets
+//	double lF = 0;
+//	for(unsigned int k = 0; k < lErrors.size(); ++k) {
+//		lF += lErrors[k];
+//	}
+//	lF = lF/lErrors.size();
+	
+	
+	//Take the worst of the two tanks
+	double lF = lErrors[0];
+	for(unsigned int k = 1; k < lErrors.size(); ++k) {
+		lF = max(lF,lErrors[k]);
+	}
+		
+	if(lF != 0)
+		lF = 1/lF;
+	else
+		lF = DBL_MAX;
+	
+	return lF;		
+			
+		
+//	std::string lTargetV = "Output_0";
+//	std::string lTargetI = "TargetI";
+//	
+//	std::string lOutputV = inBondGraph->getEffortOutputBonds()[0]->getName()+std::string(".e");
+//	std::string lOutputI = inBondGraph->getFlowOutputBonds()[0]->getName()+std::string(".f");
+//
+//	unsigned int lDataSize = inSimulationLog[lTargetV].size();
+//	
+//	assert(inSimulationLog[lTargetV].size() == inSimulationLog[lOutputV].size() );
+//	assert(inSimulationLog[lTargetV].size() == inSimulationLog["time"].size() );
+//	assert(lDataSize != 0);
+//	std::vector<double> lErrorV(lDataSize);
+//	std::vector<double> lErrorI(lDataSize);
+//	for(unsigned int i = 0; i < lDataSize; ++i) {
+//		lErrorV[i] = fabs(inSimulationLog[lOutputV][i] - inSimulationLog[lTargetV][i]);
+//		
+////		lErrorI[i] = inSimulationLog[lOutputI][i] - inSimulationLog[lTargetI][i];
+////		if(lErrorI[i] < 0)
+////			lErrorI[i] = 0; //if under limit, fine no penalty
+////		else
+////			lErrorI[i] *= lErrorI[i]; //if over, greatly penalise.
+//	}
+//	
+//	std::vector<double> lErrors(1,0);
+//	for(unsigned int i = 0; i < lDataSize-1; ++i) {
+//		double dt = inSimulationLog["time"][i+1] - inSimulationLog["time"][i];
+//		lErrors[0] += (lErrorV[i]+lErrorV[i+1])/2*dt;
+////		lErrors[1] += (lErrorI[i]+lErrorI[i+1])/2*dt;
+//	}
+	
+	//Take the mean errors of the two targets
+	//double lF = (lErrors[0]+lErrors[1])/2;
+	
+	//Take the worst of the two tanks
+//	double lF = max(lErrors[0],lErrors[1]);
+	
+//	double lF = lErrors[0];
+//	
+//	if(lF != 0)
+//		lF = 1/lF;
+//	else
+//		lF = DBL_MAX;
+//	
+//	return lF;
+}
+
+
+
+void DCDCBoostEvalOp::initialize(Beagle::System& ioSystem) {
+#ifdef USE_MPI
+	Beagle::MPI::EvaluationOp::initialize(ioSystem);
+#else
+	Beagle::EvaluationOp::initialize(ioSystem);
+#endif
+	
+	PACC::XML::Streamer lStreamer(std::cout);
+	ioSystem.getRegister().write(lStreamer,true);
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.generationstep")) {
+		mGenerationSteps = castHandleT<FloatArray>(ioSystem.getRegister()["sim.control.generationstep"]);
+	} else {
+		mGenerationSteps = new FloatArray(1,-1);
+		Register::Description lDescription(
+										   "Generation for control target transition, -1 mean no transition",
+										   "FloatArray",
+										   mGenerationSteps->serialize(),
+										   "Generation for control target transition"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.generationstep", mGenerationSteps, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.control.target")) {
+		mTargetString = castHandleT<String>(ioSystem.getRegister()["sim.control.target"]);
+	} else {
+		mTargetString = new String;
+		Register::Description lDescription(
+										   "Controller target, by pair for each control time",
+										   "String",
+										   mTargetString->serialize(),
+										   "Tank levels target for the controller"
+										   );
+		ioSystem.getRegister().addEntry("sim.control.target", mTargetString, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("bg.max.switch")) {
+		mMaxNumberSwitch = castHandleT<Int>(ioSystem.getRegister()["bg.max.switch"]);
+	} else {
+		mMaxNumberSwitch = new Int(-1);
+		Register::Description lDescription(
+										   "Maximum number of switch allowed in the bond graph, -1 is unlimited",
+										   "Int",
+										   mTargetString->serialize(),
+										   "Maximum number of switch"
+										   );
+		ioSystem.getRegister().addEntry("bg.max.switch", mMaxNumberSwitch, lDescription);
+	}
+	
+//	if(ioSystem.getRegister().isRegistered("sim.dynamic.levelini")) {
+//		mTanksLevelsIni = castHandleT<FloatArray>(ioSystem.getRegister()["sim.tanks.levelini"]);
+//	} else {
+//		mTanksLevelsIni = new FloatArray(3,0.25);
+//		Register::Description lDescription(
+//										   "Initial tank levels",
+//										   "Float",
+//										   mTanksLevelsIni->serialize(),
+//										   "Initial tank levels"
+//										   );
+//		ioSystem.getRegister().addEntry("sim.dynamic.levelini", mTanksLevelsIni, lDescription);
+//	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.dynamic.timestep")) {
+		mContinuousTimeStep = castHandleT<Float>(ioSystem.getRegister()["sim.dynamic.timestep"]);
+	} else {
+		mContinuousTimeStep = new Float(1e-4);
+		Register::Description lDescription(
+										   "Dynamic time step",
+										   "Float",
+										   mContinuousTimeStep->serialize(),
+										   "Dynamic time step"
+										   );
+		ioSystem.getRegister().addEntry("sim.dynamic.timestep", mContinuousTimeStep, lDescription);
+	}
+	
+	if(ioSystem.getRegister().isRegistered("sim.duration.time")) {
+		mSimulationDuration = castHandleT<Float>(ioSystem.getRegister()["sim.duration.time"]);
+	} else {
+		mSimulationDuration = new Float(15);
+		Register::Description lDescription(
+										   "Simulation duration",
+										   "Float",
+										   mSimulationDuration->serialize(),
+										   "Simulation duration"
+										   );
+		ioSystem.getRegister().addEntry("sim.duration.time", mSimulationDuration, lDescription);
+	}
+}
+
+
+/*!
+ *  \brief Post-initialize the evaluation operator.
+ *  \param ioSystem Evolutionary system.
+ */
+void DCDCBoostEvalOp::postInit(Beagle::System& ioSystem)
+{
+#ifdef USE_MPI
+	Beagle::MPI::EvaluationOp::postInit(ioSystem);
+#else
+	Beagle::EvaluationOp::postInit(ioSystem);
+#endif
+	
+	ioSystem.addComponent(new ParametersHolder);
+	
+//	if(*mTargetString == Beagle::String("")) {
+//		SimulationCase lCase;
+//		vector<double> lLimits(2);	lLimits[0] = 0.1; lLimits[1] = 0.5;
+//		vector<double> lTimes(1,0);
+//		lCase.createRandomCase(&ioSystem.getRandomizer(),NBOUTPUTS,lLimits,lTimes);
+//		ostringstream lStream;
+//		lCase.write(lStream);
+//		mSimulationCases.push_back(lCase);
+//		mTargetString = new String(lStream.str());
+//	} 
+	
+	readSimulationCase(*mTargetString, mSimulationCases);
+	
+	if(mSimulationCases[0].getTime(0) != 0) {
+		throw Beagle_RunTimeExceptionM("DCDCBoostEvalOp : Not applying control target at time 0");
+	}
+	
+	if(mGenerationSteps->size() > 0) {
+		if((*mGenerationSteps)[0] >= 0) {
+			if((*mGenerationSteps)[0] != 0) {
+				throw Beagle_RunTimeExceptionM("DCDCBoostEvalOp : Not applying control target at generation 0");
+			}
+		}
+	}
+}
